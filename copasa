@@ -1,0 +1,89 @@
+#!/bin/bash
+
+if [[ -z "$COPASA_MATRICULA_A" ]]; then
+  echo "sem var COPASA_MATRICULA_A"
+fi
+
+if [[ -z "$COPASA_MATRICULA_B" ]]; then
+  echo "sem var COPASA_MATRICULA_B"
+fi
+
+if [[ -z "$CIDADAO_MG_CPF" ]]; then
+  echo "env CIDADAO_MG_CPF não set"
+  exit 1
+fi
+if [[ -z "$CIDADAO_MG_PW" ]]; then
+  echo "env CIDADAO_MG_PW não set"
+  exit 1
+fi
+
+autenticar() {
+  curl -s 'https://mgapp.mg.gov.br/egov-servicos-web/rest/cidadaos/autenticar' \
+    -H 'Accept: application/json, text/plain, */*' \
+    -H 'Content-Type: application/json; charset=UTF-8' \
+    --data-raw '{"cpf":"'"$1"'","senha":"'"$2"'","tipoDispositivo":{"id":4}}'
+}
+
+function historico {
+  token="$1"
+  matricula="$2"
+  curl -s "https://mgapp.mg.gov.br/egov-servicos-web/rest/copasa/consultahistoricopormatricula/$matricula" \
+    -H 'Accept: application/json, text/plain, */*' \
+    -H "token: $token"
+}
+
+function reqPDF {
+  token="$1"
+  numFatura="$2"
+  curl -s "https://mgapp.mg.gov.br/egov-servicos-web/rest/copasa/fatura/$numFatura" \
+    -H 'Accept: application/json, text/plain, */*' \
+    -H "token: $token"
+}
+
+# ------------- autenticar -------------
+
+autenticarRes=$(autenticar "$CIDADAO_MG_CPF" "$CIDADAO_MG_PW")
+codigo=$(echo "$autenticarRes" | jq .codigoMensagem)
+if [[ $codigo != "0" ]]; then
+  msg=$(echo "$autenticarRes" | jq .mensagem)
+  echo "autenticação falhou com código $codigo e msg $msg"
+  exit 1
+fi
+token=$(echo "$autenticarRes" | jq .objeto.token | sed 's/"//g')
+if [[ "$token" = null ]]; then
+  echo -e "Autenticação falhou. Devolveu:\n$autenticarRes"
+  exit 1
+fi
+
+# ----------- obter faturas -----------
+
+matriculas=("$COPASA_MATRICULA_A" "$COPASA_MATRICULA_B")
+
+for x in "${matriculas[@]}"; do
+  # --------- obter historico ---------
+  h=$(historico "$token" "$x" )
+  codigo=$(echo "$h" | jq .codigoMensagem)
+  if [[ $codigo != "0" ]]; then
+    msg=$(echo "$h" | jq .mensagem)
+    echo "historico de $x falhou com código $codigo e msg $msg"
+    continue
+  fi
+  # ------------ obter pdf ------------
+  registro=$(echo "$h" | jq -c .objeto.registros.dchistoricoRegistro[0])
+  if [[ "$registro" = "null" ]]; then
+    echo "sem registro para $x"
+    continue
+  fi
+  numFatura=$(echo "$registro" | jq .numFatura | sed 's/"//g')
+  pdfRes=$(reqPDF "$token" "$numFatura")
+  codigo=$(echo "$pdfRes" | jq .codigoMensagem)
+  if [[ $codigo != "0" ]]; then
+    msg=$(echo "$pdfRes" | jq .mensagem)
+    echo "pdf req de $x falhou com código $codigo e msg $msg"
+    continue
+  fi
+  anoRef=$(echo "$registro" | jq .anoReferencia | sed 's/"//g')
+  mesRef=$(echo "$registro" | jq .mesReferencia | sed 's/"//g')
+  filename="$anoRef$mesRef-$x.pdf"
+  echo "$pdfRes" | jq .objeto.pdf | sed 's/"//g' | base64 --decode > "$filename"
+done
